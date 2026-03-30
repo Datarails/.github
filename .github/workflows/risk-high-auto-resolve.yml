@@ -1,22 +1,17 @@
 # ============================================================================
 # RISK:HIGH AUTO-RESOLVE ON APPROVALS
 #
-# This workflow is intended to live in the Datarails/.github org repo at:
-#   .github/workflows/risk-high-auto-resolve.yml
+# This workflow lives in the Datarails/.github org repo and runs org-wide
+# on every PR approval (or dismissal).
 #
-# It runs org-wide on every PR approval (or dismissal) and checks whether a
-# Risk:High PR has reached 2 reviewer approvals. If so, it adds a temporary
-# label to trigger the org ruleset re-run of shared-risk-analysis, which will
-# then find the approvals and pass the check.
+# When a Risk:High PR reaches 2 reviewer approvals, it re-runs the failed
+# risk analysis check directly via the GitHub API.
 #
-# On dismissal, it re-triggers the check so the risk gate stays accurate
-# when approvals are removed.
-#
-# WHY: GitHub org rulesets (required workflows) only trigger on pull_request
-# events, not pull_request_review. So approvals alone never re-trigger the
-# risk analysis check. This workflow bridges that gap.
-#
-# SETUP: Copy this file to Datarails/.github/.github/workflows/
+# WHY: GitHub org rulesets (required workflows) only trigger on push-related
+# pull_request events (opened, synchronize). They do NOT trigger on
+# pull_request_review or label changes. So approvals alone never re-trigger
+# the risk analysis check. This workflow bridges that gap by calling the
+# GitHub API to re-run the failed workflow.
 # ============================================================================
 
 name: Risk:High Auto-Resolve
@@ -30,11 +25,13 @@ jobs:
     if: github.event.review.state == 'approved' || github.event.action == 'dismissed'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       pull-requests: read
-      issues: write
+      issues: read
+      checks: read
 
     steps:
-      - name: Check Risk:High and resolve on 2 approvals
+      - name: Re-run risk analysis if Risk:High + 2 approvals
         uses: actions/github-script@v7
         with:
           script: |
@@ -81,20 +78,34 @@ jobs:
               return;
             }
 
-            // Add and remove a temporary label to trigger ruleset re-run
-            // This avoids removing Risk:High (which would cause "Missing Label" noise)
-            const triggerLabel = 'risk-recheck';
-            core.info('Adding temporary label to trigger risk analysis re-run');
-            try {
-              await github.rest.issues.addLabels({
-                owner, repo, issue_number: prNumber, labels: [triggerLabel]
-              });
-              // Small delay to ensure the labeled event fires
-              await new Promise(resolve => setTimeout(resolve, 1000));
-              await github.rest.issues.removeLabel({
-                owner, repo, issue_number: prNumber, name: triggerLabel
-              });
-            } catch (e) {
-              core.warning(`Label toggle failed: ${e.message}`);
+            // Find the failed risk analysis workflow run for this PR
+            const headSha = context.payload.pull_request.head.sha;
+            const { data: checkRuns } = await github.rest.checks.listForRef({
+              owner, repo, ref: headSha,
+              filter: 'latest'
+            });
+            const riskCheck = checkRuns.check_runs.find(
+              c => c.name === 'risk-analysis' && c.conclusion === 'failure'
+            );
+
+            if (!riskCheck) {
+              core.info('No failed risk-analysis check found — nothing to re-run');
+              return;
             }
-            core.info('Trigger label toggled — risk analysis will re-run and find approvals');
+
+            // Get the workflow run ID from the check run details URL
+            const detailsUrl = riskCheck.details_url || '';
+            const runMatch = detailsUrl.match(/\/actions\/runs\/(\d+)/);
+            if (!runMatch) {
+              core.warning('Could not extract run ID from check details URL');
+              return;
+            }
+
+            const runId = parseInt(runMatch[1]);
+            core.info(`Re-running workflow run ${runId}`);
+
+            await github.rest.actions.reRunWorkflow({
+              owner, repo, run_id: runId
+            });
+
+            core.info('Risk analysis re-run triggered — check should pass with 2 approvals');
